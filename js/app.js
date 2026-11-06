@@ -7,7 +7,8 @@ import * as store from "./store.js";
 import { notesFromRaw, detectKey } from "./pitch.js";
 import { suggestChords, chordName, chordLayer, bassLayer, harmonyLayer, continueMelody, newMelody, songToText, textToNotes, keyLabel } from "./tunes.js";
 import { exportWav, exportMp3, exportStems, exportMidi, exportProject, saveFile, shareFile } from "./export.js";
-import { openRecorder, openRoll, openImport, openSampleMaker } from "./panels.js";
+import { openRecorder, openRoll, openImport, openSampleMaker, openSection } from "./panels.js";
+import { inCuts, clipsOf, contentEnd, prepare as prepareEdit } from "./edit.js";
 
 const uid = store.uid;
 const T = S.transport;
@@ -161,30 +162,51 @@ export function drawAllLanes() {
 }
 async function drawLane(card, t) {
   const cv = card.querySelector("canvas"); const { g, w, h } = fitCanvas(cv);
-  const len = S.project.bars * 4, col = trackColor(t), line = cssVar("--line");
+  const len = S.project.bars * 4;
+  await paintLane(g, w, h, t, 0, len);
+  const cur = card.querySelector(".cursor"); cur.style.transform = `translateX(${S.cursor / len * w}px)`; cur.hidden = !S.cursor;
+}
+// Draws one layer's content between beats `from` and `to` (also used by the section editor).
+export async function paintLane(g, w, h, t, from, to) {
+  const span = to - from, X = b => (b - from) / span * w, col = trackColor(t), line = cssVar("--line"), spb = 60 / S.project.bpm, len = S.project.bars * 4;
   g.clearRect(0, 0, w, h);
-  for (let b = 0; b <= len; b++) { const x = Math.round(b / len * w) + 0.5; g.globalAlpha = b % 4 === 0 ? 0.9 : 0.25; g.strokeStyle = line; g.beginPath(); g.moveTo(x, 0); g.lineTo(x, h); g.stroke(); }
+  const step = span > 64 ? 4 : 1;
+  for (let b = Math.ceil(from / step) * step; b <= to; b += step) { const x = Math.round(X(b)) + 0.5; g.globalAlpha = b % 4 === 0 ? 0.9 : 0.25; g.strokeStyle = line; g.beginPath(); g.moveTo(x, 0); g.lineTo(x, h); g.stroke(); }
   g.globalAlpha = t.mute ? 0.3 : 0.95; g.fillStyle = col;
   if (t.type === "notes" && t.notes.length) {
     const ps = t.notes.map(n => n.p); let lo = Math.min(...ps), hi = Math.max(...ps); if (hi - lo < 8) { const m = (hi + lo) / 2; lo = m - 4; hi = m + 4; }
-    const rh = Math.max(2, (h - 8) / (hi - lo + 1));
-    for (const n of t.notes) { const x = (n.s + (t.shift || 0)) / len * w, y = 4 + (hi - n.p) * ((h - 8 - rh) / Math.max(1, hi - lo)); g.fillRect(x, y, Math.max(2, n.d / len * w - 1), rh); }
+    const rh = Math.max(2, Math.min(10, (h - 8) / (hi - lo + 1)));
+    for (const n of t.notes) { const b = n.s + (t.shift || 0); if (b > to || b + n.d < from) continue; g.globalAlpha = (t.mute ? 0.3 : 1) * (0.45 + 0.55 * (n.v ?? 0.8)); const y = 4 + (hi - n.p) * ((h - 8 - rh) / Math.max(1, hi - lo)); g.fillRect(X(b), y, Math.max(2, n.d / span * w - 1), rh); }
   } else if (t.type === "drums") {
     const rows = Object.entries(t.rows).filter(([, a]) => a.some(Boolean)); const rh = (h - 8) / Math.max(1, rows.length);
     const plen = t.steps * t.stepBeats;
-    rows.forEach(([, a], ri) => { for (let st = 0; st < len; st += plen) a.forEach((v, i) => { if (!v) return; const b = st + i * t.stepBeats; if (b >= len) return; g.globalAlpha = (t.mute ? 0.3 : 1) * [0, 0.45, 0.75, 1][v]; g.fillRect(b / len * w, 4 + ri * rh, Math.max(2, t.stepBeats / len * w - 1), Math.max(2, rh - 2)); }); });
+    rows.forEach(([, a], ri) => { for (let st = 0; st < len; st += plen) a.forEach((v, i) => { if (!v) return; const b = st + i * t.stepBeats; if (b >= len || b < from || b > to || inCuts(t.cuts, b)) return; g.globalAlpha = (t.mute ? 0.3 : 1) * [0, 0.45, 0.75, 1][v]; g.fillRect(X(b), 4 + ri * rh, Math.max(2, t.stepBeats / span * w - 1), Math.max(2, rh - 2)); }); });
   } else if (t.type === "audio") {
     try {
-      const wv = await waveOf(t.blobId), spb = 60 / S.project.bpm;
-      const startX = (t.start || 0) / len * w, durBeats = (t.trimDur ?? (wv.dur - (t.trimStart || 0))) / spb, offFrac = (t.trimStart || 0) / wv.dur;
-      const pxW = durBeats / len * w, n = wv.peaks.length;
-      for (let x = 0; x < pxW && startX + x < w; x++) { const i = Math.floor(offFrac * n + x / pxW * (durBeats * spb / wv.dur) * n); const a = wv.peaks[Math.min(n - 1, i)] || 0; const hh = Math.max(1, a * (h - 6)); g.fillRect(startX + x, h / 2 - hh / 2, 1, hh); }
+      const wv = await waveOf(t.blobId), n = wv.peaks.length;
+      for (const c of clipsOf(t, wv.dur)) {
+        const x0 = X(c.start), pxW = c.dur / spb / span * w, gain = c.gain ?? 1;
+        g.globalAlpha = t.mute ? 0.15 : 0.18; g.fillRect(x0, 2, pxW, h - 4); g.globalAlpha = t.mute ? 0.3 : 0.95;
+        for (let x = Math.max(0, -x0); x < pxW && x0 + x < w; x++) {
+          const sec = c.off + x / pxW * c.dur, i = Math.floor(sec / wv.dur * n);
+          const a = Math.min(1, (wv.peaks[Math.min(n - 1, i)] || 0) * gain), hh = Math.max(1, a * (h - 6)); g.fillRect(x0 + x, h / 2 - hh / 2, 1, hh);
+        }
+      }
     } catch (e) { g.fillStyle = cssVar("--muted"); g.font = "12px sans-serif"; g.fillText("Recording missing", 8, h / 2); }
   } else if (t.type === "drone") {
     g.globalAlpha = t.mute ? 0.15 : 0.35; g.fillRect(0, h / 2 - 8, w, 16);
   } else { g.fillStyle = cssVar("--muted"); g.font = "12px sans-serif"; g.fillText("Empty — tap to add notes", 8, h / 2 + 4); }
+  // silent parts and fades
+  const bg = cssVar("--surface-2");
+  g.globalAlpha = 0.85; g.fillStyle = bg;
+  if (t.type === "drone") for (const [a, b] of t.cuts || []) g.fillRect(X(a), 0, X(Math.min(b, len)) - X(a), h);
+  for (const f of t.fades || []) {
+    const x0 = X(f.a), x1 = X(f.b); g.beginPath();
+    if (f.type === "in") { g.moveTo(x0, 0); g.lineTo(x1, 0); g.lineTo(x0, h); } else { g.moveTo(x0, 0); g.lineTo(x1, 0); g.lineTo(x1, h); }
+    g.closePath(); g.globalAlpha = 0.7; g.fill();
+    g.globalAlpha = 1; g.strokeStyle = cssVar("--ink"); g.beginPath(); if (f.type === "in") { g.moveTo(x0, h); g.lineTo(x1, 0); } else { g.moveTo(x0, 0); g.lineTo(x1, h); } g.stroke();
+  }
   g.globalAlpha = 1;
-  const cur = card.querySelector(".cursor"); cur.style.transform = `translateX(${S.cursor / len * w}px)`; cur.hidden = !S.cursor;
 }
 function drawRuler() {
   const cv = $("ruler"); if (!cv || !S.project) return; const { g, w, h } = fitCanvas(cv);
@@ -265,7 +287,7 @@ export function addTrack(t, { open = false, silent = false } = {}) {
 }
 function trackEnd(t) {
   if (t.type === "notes") return Math.max(0, ...t.notes.map(n => n.s + n.d + (t.shift || 0)));
-  if (t.type === "audio") return (t.start || 0) + (t.trimDur || 0) * S.project.bpm / 60;
+  if (t.type === "audio") return t.clips ? contentEnd(t, 60 / S.project.bpm) : (t.start || 0) + (t.trimDur || 0) * S.project.bpm / 60;
   return 0;
 }
 export function notesTrack(name, inst, notes, extra = {}) {
@@ -300,7 +322,8 @@ function openAddLayer() {
 // ======================= layer settings =======================
 export function openTrack(t) {
   const isNotes = t.type === "notes";
-  let html = `<div class="sheet-head"><input type="text" id="tName" value="${esc(t.name)}" aria-label="Layer name"></div>`;
+  let html = `<div class="sheet-head"><input type="text" id="tName" value="${esc(t.name)}" aria-label="Layer name"></div>
+    <button class="btn wide" id="tSection">${icon("scissors")}Crop, cut, copy &amp; fade</button>`;
   if (isNotes) {
     html += `<div class="row"><button class="btn" id="tInst"><i style="width:12px;height:12px;border-radius:4px;background:${trackColor(t)}"></i>${esc(instInfo(t.inst).name)}</button>
       <button class="btn primary" id="tEdit">${icon("note")}Edit notes</button></div>
@@ -315,8 +338,8 @@ export function openTrack(t) {
   } else if (t.type === "drums") {
     html += drumEditorHtml(t);
   } else if (t.type === "audio") {
-    html += `<div class="row between"><div class="stepper">Start <button class="mini" id="aDn">−</button><b id="aV">${fmtBeats(t.start || 0)}</b><button class="mini" id="aUp">+</button></div>
-      <div class="stepper">Nudge <button class="mini" id="nDn" aria-label="Earlier by 10 ms">−</button><b id="nV">${Math.round((t.trimStart || 0) * 1000)} ms</b><button class="mini" id="nUp" aria-label="Later by 10 ms">+</button></div></div>
+    html += `<div class="row between"><div class="stepper">Move all <button class="mini" id="aDn" aria-label="Earlier by a quarter beat">−</button><button class="mini" id="aUp" aria-label="Later by a quarter beat">+</button></div>
+      <div class="stepper">Nudge <button class="mini" id="nDn" aria-label="Earlier by 10 ms">−</button><b id="nV">10 ms</b><button class="mini" id="nUp" aria-label="Later by 10 ms">+</button></div></div>
       <p class="hint">Use Nudge if the recording is slightly ahead of or behind the beat. Recordings keep their speed when you change the tempo.</p>`;
   } else if (t.type === "drone") {
     html += `<label class="field">Sa (key note)<select id="dRoot">${NOTE_NAMES.map((n, i) => `<option value="${i}"${i === t.root ? " selected" : ""}>${n}</option>`).join("")}</select></label>`;
@@ -330,6 +353,7 @@ export function openTrack(t) {
   bindSlider(b, "tPan", v => v === 0 ? "C" : (v < 0 ? "L" : "R") + Math.round(Math.abs(v) * 100), mixUpd("pan"));
   bindSlider(b, "tRev", v => Math.round(v * 100), mixUpd("rev"));
   b.querySelector("#tDel").onclick = () => { snapshot(); S.project.tracks = S.project.tracks.filter(x => x !== t); closeSheet(); changed({ structure: true }); toast("Layer deleted. Tap undo to bring it back."); };
+  b.querySelector("#tSection").onclick = () => openSection(t);
   b.querySelector("#tDup").onclick = () => { const c = structuredClone(t); delete c.id; c.name += " copy"; closeSheet(); addTrack(c); };
   if (isNotes) {
     b.querySelector("#tInst").onclick = () => openInstrumentPicker(t.inst, id => { snapshot(); t.inst = id; t.oct = instInfo(id).oct || 0; S.settings.lastInst = id; saveSettings(); changed({ structure: true }); T.refreshResources(); openTrack(t); });
@@ -347,10 +371,14 @@ export function openTrack(t) {
     b.querySelector(".chips").onclick = e => { const h = e.target.closest("[data-h]")?.dataset.h; if (h) helperAction(h, t); };
   } else if (t.type === "drums") bindDrumEditor(b, t);
   else if (t.type === "audio") {
-    const st = d => { snapshot(); t.start = Math.max(0, +((t.start || 0) + d).toFixed(3)); b.querySelector("#aV").textContent = fmtBeats(t.start); changed(); };
-    const nu = d => { snapshot(); t.trimStart = Math.max(0, +((t.trimStart || 0) + d).toFixed(3)); if (t.trimDur) t.trimDur = Math.max(0.1, t.trimDur - d); b.querySelector("#nV").textContent = Math.round(t.trimStart * 1000) + " ms"; changed(); };
-    b.querySelector("#aUp").onclick = () => st(0.25); b.querySelector("#aDn").onclick = () => st(-0.25);
-    b.querySelector("#nUp").onclick = () => nu(-0.01); b.querySelector("#nDn").onclick = () => nu(0.01);
+    // Shift every piece of the recording; beats for "Move all", seconds for "Nudge".
+    const shiftAll = async beats => {
+      try { prepareEdit(t, { fullDur: (await clipBuffer(t.blobId)).duration }); } catch (e) { return toast("This recording is missing."); }
+      const minStart = Math.min(...t.clips.map(c => c.start)); if (minStart + beats < 0) beats = -minStart;
+      snapshot(); t.clips = t.clips.map(c => ({ ...c, start: +(c.start + beats).toFixed(4) })); changed();
+    };
+    b.querySelector("#aUp").onclick = () => shiftAll(0.25); b.querySelector("#aDn").onclick = () => shiftAll(-0.25);
+    b.querySelector("#nUp").onclick = () => shiftAll(0.01 / (60 / S.project.bpm)); b.querySelector("#nDn").onclick = () => shiftAll(-0.01 / (60 / S.project.bpm));
   } else if (t.type === "drone") b.querySelector("#dRoot").onchange = e => { snapshot(); t.root = +e.target.value; changed({ structure: true }); };
 }
 export function keyOptions(sel) {

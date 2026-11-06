@@ -3,6 +3,7 @@ import { renderSong, instInfo } from "./engine.js";
 import { INSTRUMENTS, KITS } from "./instruments.js";
 import { encodeWav } from "./recorder.js";
 import { getBlob } from "./store.js";
+import { inCuts } from "./edit.js";
 
 const chans = buf => Array.from({ length: buf.numberOfChannels }, (_, i) => buf.getChannelData(i));
 const safe = s => (s || "song").replace(/[^\w\- ]+/g, "").trim().replace(/\s+/g, "-").toLowerCase() || "song";
@@ -60,6 +61,7 @@ export function midiBytes(project) {
       c = 9; const map = KITS[t.kit].gmNote, plen = t.steps * t.stepBeats;
       for (let st = 0; st < len; st += plen) for (let i = 0; i < t.steps; i++) {
         const b = st + i * t.stepBeats; if (b >= len) break;
+        if (inCuts(t.cuts, b)) continue;
         for (const [piece, arr] of Object.entries(t.rows)) if (arr[i] && map[piece]) { const tk = Math.round(b * TPQ), v = [0, 60, 90, 120][arr[i]]; evs.push([tk, 1, [0x99, map[piece], v]], [tk + 60, 0, [0x89, map[piece], 0]]); }
       }
     } else {

@@ -1,11 +1,12 @@
 // Full-screen tools: in-app recorder, file import, piano roll editor, instrument-from-song maker.
-import { $, esc, icon, S, snapshot, changed, toast, openPanel, closePanel, cssVar, fitCanvas, fmtBeats } from "./ui.js";
-import { getCtx, decodeBlob, previewNote, instInfo, ctx as _ctx, preloadProject } from "./engine.js";
+import { $, esc, icon, S, snapshot, undo, changed, toast, openPanel, closePanel, cssVar, fitCanvas, fmtBeats } from "./ui.js";
+import { getCtx, decodeBlob, previewNote, instInfo, ctx as _ctx, preloadProject, clipBuffer } from "./engine.js";
+import * as E from "./edit.js";
 import { Recorder, openMic, encodeWav } from "./recorder.js";
 import { toMono16k, analyzeHum, notesFromRaw, clipPitch } from "./pitch.js";
 import { noteName, NOTE_NAMES, SCALES } from "./instruments.js";
 import * as store from "./store.js";
-import { addTrack, notesTrack, openInstrumentPicker, keyOptions, saveSettings, loadCustom, startPlay, stopPlay, trackColor } from "./app.js";
+import { addTrack, notesTrack, openInstrumentPicker, keyOptions, saveSettings, loadCustom, startPlay, stopPlay, trackColor, paintLane, openTrack } from "./app.js";
 
 const T = S.transport;
 
@@ -127,7 +128,7 @@ async function showResult(p, { channels, sr, zeroSec, mode, inst, live }) {
     if (zeroSec < 0) { start = -zeroSec / spb; trimStart = 0; }
     const dur = channels[0].length / sr - trimStart;
     const n = S.project.tracks.filter(t => t.type === "audio").length + 1;
-    addTrack({ type: "audio", name: `Voice ${n}${suffix}`, blobId: id, start: +start.toFixed(3), trimStart: +trimStart.toFixed(4), trimDur: +dur.toFixed(4), rev: 0.15 }, { silent: !!suffix });
+    addTrack({ type: "audio", name: `Voice ${n}${suffix}`, blobId: id, clips: [{ start: +start.toFixed(4), off: +trimStart.toFixed(4), dur: +dur.toFixed(4), gain: 1 }], rev: 0.15 }, { silent: !!suffix });
   }
   async function finishVoice() {
     if (!live) { // imported audio: start at the first sound
@@ -361,4 +362,141 @@ export function openSampleMaker(onDone) {
     await store.saveInstrument(rec); await loadCustom(rec);
     toast(`Saved "${name}".`); closePanel(); onDone && onDone("custom:" + id);
   };
+}
+
+// ======================= section editor: crop, cut, copy, fades =======================
+let clipboard = null;
+export async function openSection(t) {
+  stopPlay();
+  const len = () => S.project.bars * 4, spb = () => 60 / S.project.bpm;
+  let fullDur = 0;
+  if (t.type === "audio") { try { fullDur = (await clipBuffer(t.blobId)).duration; } catch (e) { toast("This recording is missing."); return; } }
+  const ctx = () => ({ spb: spb(), fullDur });
+  if (t.type === "audio" && !t.clips) { E.prepare(t, ctx()); changed(); }
+  const structural = E.canCopy(t);
+  const st = { a: 0, b: Math.min(len(), 8), snap: 1, v0: 0, v1: len() }, cursorBefore = S.cursor;
+  if (S.cursor > 0) { st.a = Math.min(S.cursor, len() - 1); st.b = Math.min(len(), st.a + 4); }
+  const p = openPanel(`<div class="panel-head"><button class="icon-btn" id="xClose" aria-label="Done">${icon("back")}</button><h2>${esc(t.name)}</h2>
+      <button class="icon-btn" id="xUndo" aria-label="Undo">${icon("undo")}</button><button class="icon-btn" id="xPlay" aria-label="Play selection">${icon("play")}</button></div>
+    <div class="panel-body sec-body">
+      <div class="sec-top"><div><canvas class="wave" id="xCv" style="height:150px" aria-label="Layer. Drag across it to choose a part."></canvas>
+        <div class="row between" style="margin-top:6px"><div class="row" style="gap:6px"><button class="mini" id="zOut" aria-label="Zoom out">−</button><button class="mini" id="zIn" aria-label="Zoom in">+</button><span class="hint" id="xView"></span></div>
+        <label class="field" style="flex-direction:row;align-items:center;gap:6px">Snap<select id="xSnap" style="width:auto"><option value="4">Bar</option><option value="1" selected>Beat</option><option value="0.5">½ beat</option><option value="0.25">¼ beat</option><option value="0.0625">Fine</option></select></label></div></div>
+      <div class="row between">
+        <div class="stepper">From <button class="mini" data-m="a-">−</button><b id="xA"></b><button class="mini" data-m="a+">+</button></div>
+        <div class="stepper">To <button class="mini" data-m="b-">−</button><b id="xB"></b><button class="mini" data-m="b+">+</button></div>
+      </div></div>
+      <p class="hint">Drag across the layer to choose a part, or drag the orange edges.</p>
+      <div class="chips"><button class="chip" data-sel="bar">This bar</button><button class="chip" data-sel="all">Whole song</button>${structural ? `<button class="chip" data-sel="content">All of this layer</button>` : ""}</div>
+      <h3>Cut</h3>
+      <div class="chips">
+        <button class="chip" data-x="crop">✂ Keep only this part</button>
+        <button class="chip" data-x="del">🗑 Delete this part</button>
+        ${structural ? "" : `<button class="chip" data-x="restore">Bring this part back</button>`}
+      </div>
+      ${structural ? `<h3>Copy</h3><div class="chips">
+        <button class="chip" data-x="copy">Copy</button>
+        <button class="chip" data-x="paste" id="xPaste">Paste here</button>
+        <button class="chip" data-x="repeat">Repeat after it</button>
+        <button class="chip" data-x="cut">Cut</button>
+      </div>
+      <h3>Move</h3><div class="chips"><button class="chip" data-x="left">← Earlier</button><button class="chip" data-x="right">Later →</button></div>
+      <h3>Volume</h3><div class="chips"><button class="chip" data-x="soft">Softer</button><button class="chip" data-x="loud">Louder</button></div>` : ""}
+      <h3>Fade</h3>
+      <div class="chips"><button class="chip" data-x="fin">Fade in</button><button class="chip" data-x="fout">Fade out</button><button class="chip" data-x="fclear">Remove fades here</button></div>
+      <p class="hint" id="xNote">${t.type === "drums" ? "The beat repeats through the song, so Delete makes this part silent. Bring it back any time." : t.type === "drone" ? "Delete makes the drone silent in this part." : t.type === "notes" && t.raw ? "After editing here, Snap to key and Timing no longer re-shape this layer." : ""}</p>
+    </div>`, () => { window.removeEventListener("hs-frame", onFrame); ro.disconnect(); if (T().playing) stopPlay(); S.cursor = cursorBefore; changed(); });
+  const T = () => S.transport, cv = p.querySelector("#xCv");
+  const fmtPos = b => { const bar = Math.floor(b / 4) + 1, beat = Math.floor(b % 4) + 1, fr = +(b % 1).toFixed(4); return `${bar}.${beat}${fr ? ({ 0.5: "½", 0.25: "¼", 0.75: "¾" }[fr] ?? "+" + fr.toFixed(2).slice(1)) : ""}`; };
+  const snapB = b => Math.max(0, Math.min(len(), Math.round(b / st.snap) * st.snap));
+  let playB = -1;
+  async function draw() {
+    if (!cv.isConnected) return;
+    const { g, w, h } = fitCanvas(cv), span = st.v1 - st.v0, X = b => (b - st.v0) / span * w;
+    await paintLane(g, w, h, t, st.v0, st.v1);
+    const acc = cssVar("--accent"), xa = X(st.a), xb = X(st.b);
+    g.fillStyle = acc; g.globalAlpha = 0.22; g.fillRect(xa, 0, xb - xa, h); g.globalAlpha = 1;
+    for (const x of [xa, xb]) { g.fillRect(x - 1.5, 0, 3, h); g.beginPath(); g.arc(x, h / 2, 9, 0, Math.PI * 2); g.fill(); }
+    g.fillStyle = cssVar("--muted"); g.font = "10px " + cssVar("--mono");
+    const every = span > 128 ? 8 : span > 64 ? 4 : span > 32 ? 2 : 1;
+    for (let bar = Math.ceil(st.v0 / 4); bar * 4 <= st.v1; bar++) if (bar % every === 0) g.fillText(String(bar + 1), X(bar * 4) + 3, 11);
+    if (playB >= 0) { g.fillStyle = cssVar("--ink"); g.fillRect(X(playB), 0, 2, h); }
+    p.querySelector("#xA").textContent = fmtPos(st.a); p.querySelector("#xB").textContent = fmtPos(st.b);
+    p.querySelector("#xView").textContent = `Bars ${Math.floor(st.v0 / 4) + 1}–${Math.ceil(st.v1 / 4)}`;
+    const pb = p.querySelector("#xPaste"); if (pb) { pb.disabled = !E.canPaste(t, clipboard); pb.style.opacity = pb.disabled ? 0.45 : 1; pb.textContent = clipboard && E.canPaste(t, clipboard) ? `Paste here (${fmtLen(clipboard.len)})` : "Paste here"; }
+  }
+  const fmtLen = b => b % 4 === 0 ? `${b / 4} bar${b === 4 ? "" : "s"}` : `${+b.toFixed(2)} beats`;
+  var ro = new ResizeObserver(() => draw()); ro.observe(cv);
+  // dragging the selection
+  let drag = null;
+  cv.addEventListener("pointerdown", e => {
+    cv.setPointerCapture(e.pointerId);
+    const r = cv.getBoundingClientRect(), span = st.v1 - st.v0, beat = st.v0 + (e.clientX - r.left) / r.width * span;
+    const px = b => r.left + (b - st.v0) / span * r.width;
+    if (Math.abs(e.clientX - px(st.a)) < 22) drag = "a"; else if (Math.abs(e.clientX - px(st.b)) < 22) drag = "b";
+    else { drag = "new"; st.anchor = snapB(beat); st.a = st.anchor; st.b = Math.min(len(), st.anchor + st.snap); }
+    draw();
+  });
+  cv.addEventListener("pointermove", e => {
+    if (!drag) return;
+    const r = cv.getBoundingClientRect(), beat = snapB(st.v0 + (e.clientX - r.left) / r.width * (st.v1 - st.v0));
+    if (drag === "a") st.a = Math.min(beat, st.b - st.snap); else if (drag === "b") st.b = Math.max(beat, st.a + st.snap);
+    else { st.a = Math.min(st.anchor, beat); st.b = Math.max(st.anchor, beat); if (st.b - st.a < st.snap) st.b = st.a + st.snap; }
+    st.a = Math.max(0, st.a); st.b = Math.min(len(), st.b); draw();
+  });
+  const endDrag = () => { drag = null; };
+  cv.addEventListener("pointerup", endDrag); cv.addEventListener("pointercancel", endDrag);
+  p.querySelector("#xSnap").onchange = e => { st.snap = +e.target.value; };
+  const zoom = f => { const mid = (st.a + st.b) / 2, span = Math.max(2, Math.min(len(), (st.v1 - st.v0) * f)); st.v0 = Math.max(0, Math.min(len() - span, mid - span / 2)); st.v1 = st.v0 + span; draw(); };
+  p.querySelector("#zIn").onclick = () => zoom(0.5); p.querySelector("#zOut").onclick = () => zoom(2);
+  p.querySelector(".panel-body").addEventListener("click", e => {
+    const m = e.target.closest("[data-m]")?.dataset.m;
+    if (m) { const d = m.endsWith("+") ? st.snap : -st.snap; if (m[0] === "a") st.a = Math.max(0, Math.min(st.b - st.snap, st.a + d)); else st.b = Math.min(len(), Math.max(st.a + st.snap, st.b + d)); draw(); return; }
+    const sel = e.target.closest("[data-sel]")?.dataset.sel;
+    if (sel === "bar") { const bar = Math.floor(st.a / 4) * 4; st.a = bar; st.b = Math.min(len(), bar + 4); }
+    if (sel === "all") { st.a = 0; st.b = len(); st.v0 = 0; st.v1 = len(); }
+    if (sel === "content") { const end = E.contentEnd(t, spb()); st.a = 0; st.b = Math.min(len(), Math.max(st.snap, Math.ceil(end / st.snap) * st.snap)); }
+    if (sel) { draw(); return; }
+    const x = e.target.closest("[data-x]")?.dataset.x; if (x) act(x);
+  });
+  function grow(endBeat) { if (endBeat > len()) { S.project.bars = Math.min(128, Math.ceil(endBeat / 4)); st.v1 = len(); } }
+  function act(x) {
+    const { a, b } = st, c = ctx();
+    if (x === "copy") { clipboard = E.copyRange(t, a, b, c); toast(`Copied ${fmtLen(b - a)}.`); draw(); return; }
+    if (x === "paste" && !E.canPaste(t, clipboard)) { toast(clipboard ? "That was copied from a different kind of layer." : "Copy a part first."); return; }
+    snapshot();
+    let msg = "";
+    if (x === "crop") { E.cropTo(t, a, b, c); msg = "Kept only the chosen part."; }
+    if (x === "del") { E.deleteRange(t, a, b, c); msg = "Part deleted."; }
+    if (x === "cut") { clipboard = E.copyRange(t, a, b, c); E.deleteRange(t, a, b, c); msg = `Cut ${fmtLen(b - a)}. Choose a spot and tap Paste.`; }
+    if (x === "restore") { E.restoreRange(t, a, b); msg = "This part plays again."; }
+    if (x === "paste") { grow(a + clipboard.len); E.pasteAt(t, clipboard, a, c); st.b = Math.min(len(), a + clipboard.len); msg = "Pasted."; }
+    if (x === "repeat") { const clip = E.copyRange(t, a, b, c); grow(b + clip.len); E.pasteAt(t, clip, b, c); st.a = b; st.b = Math.min(len(), b + clip.len); msg = "Repeated. Tap again to repeat once more."; }
+    if (x === "left" || x === "right") { const d = E.moveRange(t, a, b, x === "left" ? -st.snap : st.snap, c); grow(b + d); st.a = a + d; st.b = b + d; }
+    if (x === "soft") { E.scaleVolume(t, a, b, 0.7, c); msg = "Softer."; }
+    if (x === "loud") { E.scaleVolume(t, a, b, 1.4, c); msg = "Louder."; }
+    if (x === "fin") { E.addFade(t, a, b, "in"); msg = "Fades in across the chosen part."; }
+    if (x === "fout") { E.addFade(t, a, b, "out"); msg = "Fades out across the chosen part."; }
+    if (x === "fclear") { E.clearFades(t, a, b); msg = "Fades removed."; }
+    changed({ structure: true }); if (msg) toast(msg); draw();
+  }
+  p.querySelector("#xUndo").onclick = () => {
+    if (!undo()) return toast("Nothing to undo.");
+    toast("Undone."); const nt = S.project.tracks.find(x => x.id === t.id);
+    if (!nt) closePanel(); else if (nt !== t) { const keep = { a: st.a, b: st.b }; closePanel(); openSection(nt).then(() => {}); } else draw();
+  };
+  p.querySelector("#xClose").onclick = () => closePanel();
+  p.querySelector("#xPlay").onclick = async () => {
+    if (T().playing) { stopPlay(); playB = -1; p.querySelector("#xPlay").innerHTML = icon("play"); draw(); return; }
+    S.cursor = st.a; started = false; await startPlay(); p.querySelector("#xPlay").innerHTML = icon("stop");
+  };
+  let started = false;
+  function onFrame(ev) {
+    if (!cv.isConnected) return; const beat = ev.detail;
+    if (beat >= st.a) started = true;
+    if (beat >= st.b - 0.02 || (started && beat < st.a - 0.05)) { stopPlay(); playB = -1; p.querySelector("#xPlay").innerHTML = icon("play"); draw(); return; }
+    playB = Math.max(0, beat); draw();
+  }
+  window.addEventListener("hs-frame", onFrame);
+  requestAnimationFrame(draw);
 }

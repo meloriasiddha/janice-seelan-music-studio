@@ -1,8 +1,8 @@
 // Offline support: the app shell is cached on install; instrument samples and fonts
 // are cached the first time they are used. Bump VERSION after changing app files.
-const VERSION = "hs-1.0.1";
+const VERSION = "hs-1.1.0";
 const SHELL = ["./", "index.html", "styles.css", "manifest.webmanifest", "vendor/lame.min.js",
-  "js/app.js", "js/ui.js", "js/engine.js", "js/store.js", "js/pitch.js", "js/recorder.js", "js/export.js", "js/tunes.js", "js/panels.js", "js/instruments.js",
+  "js/app.js", "js/ui.js", "js/engine.js", "js/store.js", "js/pitch.js", "js/recorder.js", "js/export.js", "js/tunes.js", "js/panels.js", "js/instruments.js", "js/edit.js",
   "samples/manifest.json", "icons/icon-192.png"];
 
 self.addEventListener("install", e => { e.waitUntil(caches.open(VERSION).then(c => c.addAll(SHELL)).then(() => self.skipWaiting())); });

@@ -1,6 +1,7 @@
 // Audio engine: sample loading, playback, mixer, scheduler and offline rendering.
 import { INSTRUMENTS, KITS } from "./instruments.js";
 import { getBlob } from "./store.js";
+import { inCuts, levelSegments, levelAt, clipsOf } from "./edit.js";
 
 export let ctx = null;
 let manifest = null;
@@ -113,13 +114,29 @@ export function buildMix(c, project) {
   const strips = {};
   const anySolo = project.tracks.some(t => t.solo);
   for (const t of project.tracks) {
-    const g = c.createGain(), pan = c.createStereoPanner ? c.createStereoPanner() : null, send = c.createGain();
-    g.gain.value = trackGain(t, anySolo);
-    if (pan) { pan.pan.value = t.pan || 0; g.connect(pan); pan.connect(master); pan.connect(send); } else { g.connect(master); g.connect(send); }
+    const g = c.createGain(), auto = c.createGain(), pan = c.createStereoPanner ? c.createStereoPanner() : null, send = c.createGain();
+    g.gain.value = trackGain(t, anySolo); g.connect(auto); // auto: fades and silent parts
+    if (pan) { pan.pan.value = t.pan || 0; auto.connect(pan); pan.connect(master); pan.connect(send); } else { auto.connect(master); auto.connect(send); }
     send.gain.value = t.rev ?? 0.2; send.connect(rev);
-    strips[t.id] = { in: g, pan, send };
+    strips[t.id] = { in: g, auto, pan, send };
   }
   return { master, comp, rev, strips, nodes: [master, comp, rev, revGain] };
+}
+// Schedules each layer's fades / silent parts for one pass of the song that starts at loopStart.
+export function scheduleLevels(c, mix, project, loopStart, spb, fromBeat = 0) {
+  const now = c.currentTime;
+  for (const t of project.tracks) {
+    const st = mix.strips[t.id]; if (!st) continue;
+    const segs = levelSegments(t), ag = st.auto.gain;
+    ag.setValueAtTime(levelAt(segs, fromBeat), Math.max(now, loopStart + fromBeat * spb));
+    for (const sg of segs) {
+      if (sg.b <= fromBeat) continue;
+      const a = Math.max(sg.a, fromBeat), Ta = Math.max(now, loopStart + a * spb), Tb = loopStart + sg.b * spb;
+      if (a > fromBeat) { ag.setValueAtTime(1, Ta); ag.linearRampToValueAtTime(sg.from, Ta + 0.008); }
+      ag.linearRampToValueAtTime(sg.to, Math.max(Ta + 0.01, Tb));
+      ag.linearRampToValueAtTime(1, Math.max(Ta + 0.02, Tb + 0.008));
+    }
+  }
 }
 export function trackGain(t, anySolo) { if (t.mute) return 0; if (anySolo && !t.solo) return 0; return t.vol ?? 0.8; }
 
@@ -174,10 +191,11 @@ export function buildEvents(project, includeMuted = true) {
       const plen = t.steps * t.stepBeats;
       for (let start = 0; start < len; start += plen) for (let i = 0; i < t.steps; i++) {
         const b = start + i * t.stepBeats; if (b >= len) break;
+        if (inCuts(t.cuts, b)) continue;
         for (const [piece, arr] of Object.entries(t.rows)) if (arr[i]) ev.push({ tid: t.id, k: "d", kit: t.kit, piece, b, lv: arr[i] });
       }
     } else if (t.type === "audio") {
-      const b = t.start || 0; if (b < len) ev.push({ tid: t.id, k: "a", blobId: t.blobId, b, off: t.trimStart || 0, dur: t.trimDur });
+      for (const c of clipsOf(t)) if (c.start < len && c.dur > 0.005) ev.push({ tid: t.id, k: "a", blobId: t.blobId, b: c.start, off: c.off, dur: t.clips || t.trimDur != null ? c.dur : undefined, gain: c.gain ?? 1 });
     } else if (t.type === "drone") {
       ev.push({ tid: t.id, k: "drone", root: t.root ?? 0, b: 0 });
     }
@@ -207,7 +225,9 @@ export function fireEvent(c, mix, res, e, t, spb, loopEndTime) {
     const src = c.createBufferSource(); src.buffer = buf;
     const g = c.createGain(); src.connect(g); g.connect(out);
     const dur = Math.min(e.dur ?? buf.duration - e.off, buf.duration - e.off, Math.max(0.01, loopEndTime - t));
-    g.gain.setValueAtTime(1, t); g.gain.setValueAtTime(1, t + Math.max(0, dur - 0.02)); g.gain.linearRampToValueAtTime(0, t + dur);
+    if (dur <= 0.005) return;
+    const gv = e.gain ?? 1, edge = Math.min(0.005, dur / 4);
+    g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(gv, t + edge); g.gain.setValueAtTime(gv, t + Math.max(edge, dur - edge)); g.gain.linearRampToValueAtTime(0, t + dur);
     src.start(t, e.off, dur + 0.01);
   } else if (e.k === "drone" && res.drone) {
     // Tanpura sample is tuned to G (Sa = G). Shift to the chosen Sa, staying close.
@@ -253,6 +273,7 @@ export class Transport {
         }
       }
     }
+    s.levelDone = new Set();
     s.timer = setInterval(() => this.tick(), 25); this.tick();
     return s;
   }
@@ -263,14 +284,22 @@ export class Transport {
   }
   tick() {
     const s = this.s; if (!s) return; const c = ctx;
-    if (s.dirty) { s.events = buildEvents(s.project, false); s.dirty = false; }
     const now = (c.currentTime - s.t0) / s.spb, target = now + 0.3 / s.spb;
+    if (s.dirty) {
+      s.events = buildEvents(s.project, false); s.dirty = false;
+      // Re-plan fades / silent parts from the current position.
+      if (now >= 0) {
+        const k = Math.floor(now / s.len); for (const st of Object.values(s.mix.strips)) st.auto.gain.cancelScheduledValues(c.currentTime);
+        s.levelDone = new Set([k]); scheduleLevels(c, s.mix, s.project, s.t0 + k * s.len * s.spb, s.spb, now - k * s.len);
+      }
+    }
     if (!s.project.loop && now > s.len + 1) { this.stop(); return; }
     if (s.sched < target) {
       const k0 = Math.floor(s.sched / s.len), k1 = Math.floor(target / s.len);
       for (let k = Math.max(0, k0); k <= k1; k++) {
         if (!s.project.loop && k > 0) break;
         const loopEnd = s.t0 + (k + 1) * s.len * s.spb;
+        if (!s.levelDone.has(k)) { s.levelDone.add(k); const from = k === Math.floor(s.fromBeat / s.len) ? s.fromBeat - k * s.len : 0; scheduleLevels(c, s.mix, s.project, s.t0 + k * s.len * s.spb, s.spb, from); }
         for (const e of s.events) {
           const abs = k * s.len + e.b;
           if (abs >= s.sched && abs < target) {
@@ -326,6 +355,7 @@ export async function renderSong(project, { sampleRate = 48000, onlyTrack = null
   const mix = buildMix(oc, p);
   if (onlyTrack) { mix.comp.threshold.value = 0; mix.comp.ratio.value = 1; }
   const offset = 0.02, loopEnd = offset + len * spb;
+  scheduleLevels(oc, mix, p, offset, spb, 0);
   for (const e of buildEvents(p, false)) fireEvent(oc, mix, res, e, offset + e.b * spb, spb, loopEnd + (e.k === "drone" ? 1.5 : 0));
   return oc.startRendering();
 }

@@ -14,6 +14,7 @@ No build step: plain HTML, CSS and ES modules. Hosted on GitHub Pages; pushing t
 - `js/pitch.js` — YIN pitch tracking, note segmentation, tuning correction, key detection, quantise/snap.
 - `js/tunes.js` — tune helper (chords, bass, harmony, continue, new melody) + text format for swapping notes with Claude.
 - `js/export.js` — WAV, MP3 (vendor/lame.min.js), stems zip, MIDI, `.humsong` backup.
+- `js/edit.js` — section editing (crop, delete, copy/paste, repeat, move, volume, fades) as pure functions on a track; level automation segments.
 - `js/store.js` — IndexedDB: projects, recordings (blobs), custom instruments, settings.
 - `js/instruments.js` — instrument catalogue, drum kits, drum/tabla presets, scales & ragas.
 - `samples/` — instrument samples, `samples/manifest.json` lists the notes for each instrument folder.
@@ -23,8 +24,9 @@ No build step: plain HTML, CSS and ES modules. Hosted on GitHub Pages; pushing t
 Track common: `{id, type, name, vol, pan, rev, mute, solo}`
 - `notes`: `inst, oct, shift (beats), notes:[{p midi, s beat, d beats, v 0-1}], raw?` (raw = hummed notes in seconds, re-snapped when key/timing changes)
 - `drums`: `kit ("kit"|"tabla"), steps, stepBeats, rows:{piece:[0-3 per step]}`
-- `audio`: `blobId, start (beats), trimStart (s), trimDur (s)`
+- `audio`: `blobId, clips:[{start (beats), off (s), dur (s), gain}]` (old songs: `start, trimStart, trimDur`, converted on first edit)
 - `drone`: `root (0-11)` — tanpura sample is Sa=G, pitch-shifted.
+- Any track: `fades:[{a,b,type:'in'|'out'}]` (beats). Drums/drone: `cuts:[[a,b]]` silent ranges (the beat loops, so crop/delete silences instead).
 
 ## Text format for tunes (Claude ⇄ app)
 `NOTE@BEAT LENGTH`, e.g. `C4@0 1, E4@1 0.5, G4@1.5 0.5`. Parsed by `textToNotes` in `js/tunes.js`.
